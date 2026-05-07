@@ -1,0 +1,122 @@
+name: Build and Publish Assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Release tag for this assets repo (example: v0.1.4)"
+        required: true
+        type: string
+      source_ref:
+        description: "Ref in iocontext/iocontext-cli to build (example: v0.1.4, main)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cli_bin: iocontext.exe
+            mcp_bin: iocontext-mcp.exe
+          - name: macos-x64
+            os: macos-14
+            target: x86_64-apple-darwin
+            cli_bin: iocontext
+            mcp_bin: iocontext-mcp
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            cli_bin: iocontext
+            mcp_bin: iocontext-mcp
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cli_bin: iocontext
+            mcp_bin: iocontext-mcp
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cli_bin: iocontext
+            mcp_bin: iocontext-mcp
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          repository: iocontext/iocontext-cli
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Build binaries
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }} --bin iocontext --bin iocontext-mcp
+
+      - name: Build binaries (Linux ARM64 cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }} --bin iocontext --bin iocontext-mcp
+
+      - name: Prepare assets (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          $cliAsset = "iocontext-${{ matrix.target }}-${{ matrix.cli_bin }}"
+          $mcpAsset = "iocontext-${{ matrix.target }}-${{ matrix.mcp_bin }}"
+          $cliSrc = "target/${{ matrix.target }}/release/${{ matrix.cli_bin }}"
+          $mcpSrc = "target/${{ matrix.target }}/release/${{ matrix.mcp_bin }}"
+          $cliOut = "release-assets/$cliAsset"
+          $mcpOut = "release-assets/$mcpAsset"
+          Copy-Item $cliSrc $cliOut -Force
+          Copy-Item $mcpSrc $mcpOut -Force
+          $cliHash = (Get-FileHash -Path $cliOut -Algorithm SHA256).Hash.ToLower()
+          $mcpHash = (Get-FileHash -Path $mcpOut -Algorithm SHA256).Hash.ToLower()
+          "$cliHash  $cliAsset" | Set-Content -Path "$cliOut.sha256" -NoNewline
+          "$mcpHash  $mcpAsset" | Set-Content -Path "$mcpOut.sha256" -NoNewline
+
+      - name: Prepare assets (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p release-assets
+          CLI_ASSET="iocontext-${{ matrix.target }}-${{ matrix.cli_bin }}"
+          MCP_ASSET="iocontext-${{ matrix.target }}-${{ matrix.mcp_bin }}"
+          CLI_SRC="target/${{ matrix.target }}/release/${{ matrix.cli_bin }}"
+          MCP_SRC="target/${{ matrix.target }}/release/${{ matrix.mcp_bin }}"
+          CLI_OUT="release-assets/${CLI_ASSET}"
+          MCP_OUT="release-assets/${MCP_ASSET}"
+          cp "${CLI_SRC}" "${CLI_OUT}"
+          cp "${MCP_SRC}" "${MCP_OUT}"
+          chmod +x "${CLI_OUT}" "${MCP_OUT}"
+          shasum -a 256 "${CLI_OUT}" | awk '{print $1"  '"${CLI_ASSET}"'"}' > "${CLI_OUT}.sha256"
+          shasum -a 256 "${MCP_OUT}" | awk '{print $1"  '"${MCP_ASSET}"'"}' > "${MCP_OUT}.sha256"
+
+      - name: Publish assets to this repository release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version_tag }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
