@@ -19,6 +19,9 @@ jobs:
   build-and-upload:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Keep in sync with tools/build_release_assets.ps1 ($RipgrepVersion default)
+      RIPGREP_VERSION: "14.1.1"
     strategy:
       fail-fast: false
       matrix:
@@ -98,6 +101,34 @@ jobs:
           "$cliHash  $cliAsset" | Set-Content -Path "$cliOut.sha256" -NoNewline
           "$mcpHash  $mcpAsset" | Set-Content -Path "$mcpOut.sha256" -NoNewline
 
+          $triple = "${{ matrix.target }}"
+          $ver = $env:RIPGREP_VERSION
+          $archiveName = switch ($triple) {
+            "x86_64-pc-windows-msvc" { "ripgrep-$ver-x86_64-pc-windows-msvc.zip" }
+            "aarch64-pc-windows-msvc" { "ripgrep-$ver-aarch64-pc-windows-msvc.zip" }
+            default { $null }
+          }
+          if (-not $archiveName) { throw "Unexpected Windows target for ripgrep: $triple" }
+          $url = "https://github.com/BurntSushi/ripgrep/releases/download/$ver/$archiveName"
+          $tempRoot = Join-Path $env:RUNNER_TEMP ("iocontext-rg-" + [Guid]::NewGuid().ToString("N"))
+          $archivePath = Join-Path $tempRoot $archiveName
+          $extractDir = Join-Path $tempRoot "extract"
+          New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+          New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $archivePath
+            Expand-Archive -Path $archivePath -DestinationPath $extractDir -Force
+            $rgPath = Get-ChildItem -Path $extractDir -Recurse -File -Filter "rg.exe" | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $rgPath) { throw "ripgrep binary not found in archive: $archiveName" }
+            $rgAsset = "iocontext-$triple-rg.exe"
+            $rgOut = "release-assets/$rgAsset"
+            Copy-Item $rgPath $rgOut -Force
+            $rgHash = (Get-FileHash -Path $rgOut -Algorithm SHA256).Hash.ToLower()
+            "$rgHash  $rgAsset" | Set-Content -Path "$rgOut.sha256" -NoNewline
+          } finally {
+            if (Test-Path $tempRoot) { Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+
       - name: Prepare assets (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
@@ -113,6 +144,28 @@ jobs:
           chmod +x "${CLI_OUT}" "${MCP_OUT}"
           shasum -a 256 "${CLI_OUT}" | awk '{print $1"  '"${CLI_ASSET}"'"}' > "${CLI_OUT}.sha256"
           shasum -a 256 "${MCP_OUT}" | awk '{print $1"  '"${MCP_ASSET}"'"}' > "${MCP_OUT}.sha256"
+
+          TARGET="${{ matrix.target }}"
+          VER="${RIPGREP_VERSION}"
+          case "${TARGET}" in
+            x86_64-apple-darwin) ARCHIVE="ripgrep-${VER}-x86_64-apple-darwin.tar.gz" ;;
+            aarch64-apple-darwin) ARCHIVE="ripgrep-${VER}-aarch64-apple-darwin.tar.gz" ;;
+            x86_64-unknown-linux-gnu) ARCHIVE="ripgrep-${VER}-x86_64-unknown-linux-musl.tar.gz" ;;
+            aarch64-unknown-linux-gnu) ARCHIVE="ripgrep-${VER}-aarch64-unknown-linux-gnu.tar.gz" ;;
+            *) echo "Unexpected target for ripgrep: ${TARGET}" >&2; exit 1 ;;
+          esac
+          TMP_RG="$(mktemp -d)"
+          curl -fsSL -o "${TMP_RG}/${ARCHIVE}" "https://github.com/BurntSushi/ripgrep/releases/download/${VER}/${ARCHIVE}"
+          mkdir -p "${TMP_RG}/extract"
+          tar -xzf "${TMP_RG}/${ARCHIVE}" -C "${TMP_RG}/extract"
+          RG_PATH="$(find "${TMP_RG}/extract" -type f -name rg -print -quit)"
+          if [ -z "${RG_PATH}" ]; then echo "ripgrep binary not found in ${ARCHIVE}" >&2; exit 1; fi
+          RG_ASSET="iocontext-${TARGET}-rg"
+          RG_OUT="release-assets/${RG_ASSET}"
+          cp "${RG_PATH}" "${RG_OUT}"
+          chmod +x "${RG_OUT}"
+          shasum -a 256 "${RG_OUT}" | awk -v n="${RG_ASSET}" '{print $1"  "n}' > "${RG_OUT}.sha256"
+          rm -rf "${TMP_RG}"
 
       - name: Publish assets to this repository release
         uses: softprops/action-gh-release@v2
